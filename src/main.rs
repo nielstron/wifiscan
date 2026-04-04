@@ -86,10 +86,13 @@ struct WifiScanApp {
     cameras: Vec<CameraInfo>,
     selected_camera: usize,
     frame_rx: Receiver<FrameUpdate>,
+    connect_rx: Receiver<ConnectResult>,
+    connect_tx: Sender<ConnectResult>,
     stop_tx: Option<Sender<()>>,
     texture: Option<TextureHandle>,
     preview_aspect_ratio: Option<f32>,
     last_scan: Option<ScanResult>,
+    connect_in_flight: bool,
     connect_prompt_open: bool,
     status: String,
     last_preview_update: Instant,
@@ -103,6 +106,7 @@ struct WifiScanApp {
 impl WifiScanApp {
     fn new(cameras: Vec<CameraInfo>) -> Self {
         let selected_camera = default_camera_index(&cameras);
+        let (connect_tx, connect_rx) = unbounded();
         let (selected_camera, frame_rx, stop_tx, status) =
             match start_first_available_camera(&cameras, selected_camera) {
                 Ok((selected_camera, frame_rx, stop_tx)) => (
@@ -123,10 +127,13 @@ impl WifiScanApp {
             cameras,
             selected_camera,
             frame_rx,
+            connect_rx,
+            connect_tx,
             stop_tx,
             texture: None,
             preview_aspect_ratio: None,
             last_scan: None,
+            connect_in_flight: false,
             connect_prompt_open: false,
             status,
             last_preview_update: Instant::now(),
@@ -186,6 +193,7 @@ impl WifiScanApp {
 
         self.selected_camera = index;
         self.last_scan = None;
+        self.connect_in_flight = false;
         self.connect_prompt_open = false;
 
         if self.window_visible {
@@ -314,6 +322,7 @@ impl eframe::App for WifiScanApp {
                 FrameUpdate::Scan(scan) => {
                     self.status = format!("Found network '{}'.", scan.credentials.ssid);
                     self.last_scan = Some(scan);
+                    self.connect_in_flight = false;
                     self.connect_prompt_open = true;
                     self.set_window_visible(ctx, true);
                 }
@@ -321,6 +330,15 @@ impl eframe::App for WifiScanApp {
                     self.status = message;
                 }
             }
+        }
+
+        while let Ok(result) = self.connect_rx.try_recv() {
+            self.connect_in_flight = false;
+            self.status = match result.result {
+                Ok(()) => format!("Connected to '{}'.", result.ssid),
+                Err(err) => format!("Connection failed: {err:#}"),
+            };
+            self.connect_prompt_open = false;
         }
 
         #[cfg(target_os = "macos")]
@@ -441,10 +459,24 @@ impl eframe::App for WifiScanApp {
                             );
                         }
                         ui.add_space(14.0);
+                        if self.connect_in_flight {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new().size(18.0));
+                                ui.label(
+                                    egui::RichText::new("Connecting…")
+                                        .size(14.0)
+                                        .color(egui::Color32::from_gray(110)),
+                                );
+                            });
+                            ui.add_space(12.0);
+                        }
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
                             if ui
-                                .add_sized([110.0, 36.0], egui::Button::new("Copy Password"))
+                                .add_enabled(
+                                    !self.connect_in_flight,
+                                    egui::Button::new("Copy Password"),
+                                )
                                 .clicked()
                             {
                                 ctx.copy_text(scan.credentials.password.clone());
@@ -454,15 +486,21 @@ impl eframe::App for WifiScanApp {
                                 );
                             }
                             if ui
-                                .add_sized([110.0, 36.0], egui::Button::new("Connect"))
+                                .add_enabled(
+                                    !self.connect_in_flight,
+                                    egui::Button::new("Connect"),
+                                )
                                 .clicked()
                             {
-                                let result = connect_to_wifi(&scan.credentials);
-                                self.status = match result {
-                                    Ok(()) => format!("Connected to '{}'.", scan.credentials.ssid),
-                                    Err(err) => format!("Connection failed: {err:#}"),
-                                };
-                                self.connect_prompt_open = false;
+                                self.connect_in_flight = true;
+                                self.status = format!("Connecting to '{}'…", scan.credentials.ssid);
+                                let credentials = scan.credentials.clone();
+                                let connect_tx = self.connect_tx.clone();
+                                thread::spawn(move || {
+                                    let ssid = credentials.ssid.clone();
+                                    let result = connect_to_wifi(&credentials);
+                                    let _ = connect_tx.send(ConnectResult { ssid, result });
+                                });
                             }
                         });
                     });
@@ -511,6 +549,11 @@ struct WifiCredentials {
 #[derive(Clone, Debug)]
 struct ScanResult {
     credentials: WifiCredentials,
+}
+
+struct ConnectResult {
+    ssid: String,
+    result: Result<()>,
 }
 
 enum FrameUpdate {
