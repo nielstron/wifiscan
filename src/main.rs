@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use image::DynamicImage;
 use nokhwa::{
@@ -350,7 +350,10 @@ fn start_camera_worker(
 ) -> Result<(Receiver<FrameUpdate>, Sender<()>)> {
     let camera = camera.context("no camera available")?;
     let (frame_tx, frame_rx) = bounded(2);
+    let (detect_tx, detect_rx) = bounded(1);
     let (stop_tx, stop_rx) = unbounded();
+
+    spawn_detection_worker(frame_tx.clone(), detect_rx, stop_rx.clone());
 
     thread::spawn(move || {
         let index = match camera.index().as_index() {
@@ -379,8 +382,6 @@ fn start_camera_worker(
             )));
             return;
         }
-
-        let mut last_payload = None;
 
         loop {
             if stop_rx.try_recv().is_ok() {
@@ -416,13 +417,44 @@ fn start_camera_worker(
             let _ = frame_tx.try_send(FrameUpdate::Preview(color));
 
             let frame_image = DynamicImage::ImageRgb8(rgb);
+            match detect_tx.try_send(frame_image) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+    });
+
+    Ok((frame_rx, stop_tx))
+}
+
+fn spawn_detection_worker(
+    frame_tx: Sender<FrameUpdate>,
+    detect_rx: Receiver<DynamicImage>,
+    stop_rx: Receiver<()>,
+) {
+    thread::spawn(move || {
+        let mut last_payload = None;
+
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+
+            let Ok(mut frame_image) = detect_rx.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+
+            while let Ok(newer_frame) = detect_rx.try_recv() {
+                frame_image = newer_frame;
+            }
+
             if let Some(payload) = decode_qr_from_image_current(&frame_image) {
                 if last_payload.as_deref() != Some(payload.as_str()) {
                     match parse_wifi_qr(&payload) {
                         Ok(credentials) => {
                             last_payload = Some(payload);
-                            let _ = frame_tx
-                                .try_send(FrameUpdate::Scan(ScanResult { credentials }));
+                            let _ = frame_tx.try_send(FrameUpdate::Scan(ScanResult { credentials }));
                         }
                         Err(err) => {
                             let _ = frame_tx.try_send(FrameUpdate::Error(format!(
@@ -434,8 +466,6 @@ fn start_camera_worker(
             }
         }
     });
-
-    Ok((frame_rx, stop_tx))
 }
 
 fn empty_receiver<T>() -> Receiver<T> {
