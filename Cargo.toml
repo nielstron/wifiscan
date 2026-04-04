@@ -19,3 +19,4 @@ zxing-cpp = { version = "0.5.1", features = ["bundled", "image"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSDictionary", "NSObject", "NSString"] }
 objc2-vision = { version = "0.3.2", features = ["VNDetectBarcodesRequest", "VNObservation", "VNRequest", "VNRequestHandler", "VNTypes"] }
+tray-icon = "0.22.0"

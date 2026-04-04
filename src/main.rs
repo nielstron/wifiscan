@@ -12,6 +12,11 @@ use nokhwa::{
     utils::{ApiBackend, CameraIndex, CameraInfo, RequestedFormat, RequestedFormatType},
 };
 use qrcode_generator::QrCodeEcc;
+#[cfg(target_os = "macos")]
+use tray_icon::{
+    MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    menu::{Menu, MenuEvent, MenuItem},
+};
 use wifiscan::decode::{decode_qr_from_image_current, decode_qr_from_path};
 
 fn main() -> Result<()> {
@@ -60,7 +65,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let native_options = eframe::NativeOptions::default();
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("WiFi QR Scanner")
+            .with_inner_size([420.0, 720.0]),
+        ..Default::default()
+    };
 
     eframe::run_native(
         "WiFi QR Scanner",
@@ -77,17 +87,21 @@ struct WifiScanApp {
     frame_rx: Receiver<FrameUpdate>,
     stop_tx: Option<Sender<()>>,
     texture: Option<TextureHandle>,
-    selected_camera: usize,
     last_scan: Option<ScanResult>,
     connect_prompt_open: bool,
     status: String,
     last_preview_update: Instant,
+    window_visible: bool,
+    #[cfg(target_os = "macos")]
+    tray: Option<MenuBarState>,
+    #[cfg(target_os = "macos")]
+    should_quit: bool,
 }
 
 impl WifiScanApp {
     fn new(cameras: Vec<CameraInfo>) -> Self {
         let selected_camera = default_camera_index(&cameras);
-        let (selected_camera, frame_rx, stop_tx, status) =
+        let (_selected_camera, frame_rx, stop_tx, status) =
             match start_first_available_camera(&cameras, selected_camera) {
                 Ok((selected_camera, frame_rx, stop_tx)) => (
                     selected_camera,
@@ -108,41 +122,90 @@ impl WifiScanApp {
             frame_rx,
             stop_tx,
             texture: None,
-            selected_camera,
             last_scan: None,
             connect_prompt_open: false,
             status,
             last_preview_update: Instant::now(),
+            window_visible: true,
+            #[cfg(target_os = "macos")]
+            tray: None,
+            #[cfg(target_os = "macos")]
+            should_quit: false,
         }
     }
 
-    fn restart_camera(&mut self) {
-        if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
+    #[cfg(target_os = "macos")]
+    fn ensure_menu_bar(&mut self) {
+        if self.tray.is_some() {
+            return;
         }
 
-        self.texture = None;
-        self.last_scan = None;
-        self.connect_prompt_open = false;
-        self.last_preview_update = Instant::now();
-
-        let camera = self.cameras.get(self.selected_camera).cloned();
-        match start_camera_worker(camera) {
-            Ok((frame_rx, stop_tx)) => {
-                self.frame_rx = frame_rx;
-                self.stop_tx = Some(stop_tx);
-                self.status = "Point the camera at a Wi-Fi QR code.".to_owned();
-            }
+        match MenuBarState::new() {
+            Ok(tray) => self.tray = Some(tray),
             Err(err) => {
-                self.frame_rx = empty_receiver();
-                self.status = describe_camera_error(&err);
+                self.status = format!("Failed to start menu bar icon: {err:#}");
             }
+        }
+    }
+
+    fn set_window_visible(&mut self, ctx: &egui::Context, visible: bool) {
+        self.window_visible = visible;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+        if visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 }
 
 impl eframe::App for WifiScanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        self.ensure_menu_bar();
+
+        #[cfg(target_os = "macos")]
+        if let Some(tray) = &self.tray {
+            let toggle_id = tray.toggle_item.id().clone();
+            let quit_id = tray.quit_item.id().clone();
+            let tray_id = tray.icon.id().clone();
+            let mut toggle_window = false;
+
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                if event.id == toggle_id {
+                    toggle_window = true;
+                } else if event.id == quit_id {
+                    self.should_quit = true;
+                }
+            }
+
+            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                if event.id() != &tray_id {
+                    continue;
+                }
+
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    toggle_window = true;
+                }
+            }
+
+            if toggle_window {
+                self.set_window_visible(ctx, !self.window_visible);
+            }
+        }
+
+        if ctx.input(|input| input.viewport().close_requested()) && !self.should_quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.set_window_visible(ctx, false);
+        }
+
+        if self.should_quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
         while let Ok(update) = self.frame_rx.try_recv() {
             match update {
                 FrameUpdate::Preview(image) => {
@@ -153,12 +216,10 @@ impl eframe::App for WifiScanApp {
                     self.last_preview_update = Instant::now();
                 }
                 FrameUpdate::Scan(scan) => {
-                    self.status = format!(
-                        "Found network '{}' using {} security.",
-                        scan.credentials.ssid, scan.credentials.auth_type
-                    );
+                    self.status = format!("Found network '{}'.", scan.credentials.ssid);
                     self.last_scan = Some(scan);
                     self.connect_prompt_open = true;
+                    self.set_window_visible(ctx, true);
                 }
                 FrameUpdate::Error(message) => {
                     self.status = message;
@@ -166,107 +227,82 @@ impl eframe::App for WifiScanApp {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Wi-Fi QR Scanner");
-            ui.separator();
-
-            if self.cameras.is_empty() {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "No cameras detected. Connect a camera and restart the app.",
-                );
+        #[cfg(target_os = "macos")]
+        if let Some(tray) = &self.tray {
+            tray.toggle_item.set_text(if self.window_visible {
+                "Hide Window"
             } else {
-                let selected_name = self
-                    .cameras
-                    .get(self.selected_camera)
-                    .map(CameraInfo::human_name)
-                    .unwrap_or("Unknown camera".to_owned());
+                "Show Window"
+            });
+        }
 
-                egui::ComboBox::from_label("Camera")
-                    .selected_text(selected_name)
-                    .show_ui(ui, |ui| {
-                        let mut changed = false;
-                        for (index, camera) in self.cameras.iter().enumerate() {
-                            changed |= ui
-                                .selectable_value(
-                                    &mut self.selected_camera,
-                                    index,
-                                    camera.human_name(),
-                                )
-                                .changed();
-                        }
-                        if changed {
-                            self.restart_camera();
-                        }
-                    });
-            }
-
-            ui.separator();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let panel_rect = ui.max_rect();
 
             if let Some(texture) = &self.texture {
-                let available = ui.available_width();
                 let image_size = texture.size_vec2();
-                let scale = (available / image_size.x).min(1.0);
-                ui.image((texture.id(), image_size * scale));
+                let scale = (panel_rect.width() / image_size.x)
+                    .max(panel_rect.height() / image_size.y);
+                let scaled_size = image_size * scale;
+                let image_rect = egui::Rect::from_center_size(panel_rect.center(), scaled_size);
+                ui.put(
+                    image_rect,
+                    egui::Image::new((texture.id(), scaled_size))
+                        .corner_radius(egui::CornerRadius::same(24)),
+                );
             } else {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 320.0),
-                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                ui.allocate_ui_at_rect(
+                    panel_rect,
                     |ui| {
-                        ui.label("Waiting for camera frames...");
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(24, 24, 26))
+                            .corner_radius(egui::CornerRadius::same(24))
+                            .show(ui, |ui| {
+                                ui.with_layout(
+                                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Opening camera…")
+                                                .size(24.0)
+                                                .color(egui::Color32::from_gray(220)),
+                                        );
+                                    },
+                                );
+                            });
                     },
                 );
             }
 
-            ui.separator();
-            ui.label(&self.status);
-
-            if self.stop_tx.is_some()
-                && self.last_preview_update.elapsed() > Duration::from_secs(3)
-                && !self.cameras.is_empty()
+            if !self.status.starts_with("Point the camera")
+                || (self.stop_tx.is_some()
+                    && self.last_preview_update.elapsed() > Duration::from_secs(3)
+                    && !self.cameras.is_empty())
             {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "The camera preview has stalled. Re-select the camera to restart it.",
+                let message = if self.stop_tx.is_some()
+                    && self.last_preview_update.elapsed() > Duration::from_secs(3)
+                    && !self.cameras.is_empty()
+                {
+                    "Camera preview stalled".to_owned()
+                } else {
+                    self.status.clone()
+                };
+                let overlay_rect = egui::Rect::from_min_size(
+                    panel_rect.min + egui::vec2(20.0, 20.0),
+                    egui::vec2((panel_rect.width() - 40.0).min(420.0), 52.0),
                 );
-            }
-
-            if let Some(scan) = &self.last_scan {
-                ui.separator();
-                ui.monospace(format!("SSID: {}", scan.credentials.ssid));
-                ui.monospace(format!(
-                    "Password: {}",
-                    if scan.credentials.password.is_empty() {
-                        "<empty>"
-                    } else {
-                        &scan.credentials.password
-                    }
-                ));
-                if scan.credentials.hidden {
-                    ui.monospace("Hidden network: true");
-                }
-
-                ui.horizontal(|ui| {
-                    if ui.button("Connect").clicked() {
-                        let result = connect_to_wifi(&scan.credentials);
-                        self.status = match result {
-                            Ok(()) => format!("Connected to '{}'.", scan.credentials.ssid),
-                            Err(err) => format!("Connection failed: {err:#}"),
-                        };
-                        self.connect_prompt_open = false;
-                    }
-
-                    if ui
-                        .add_enabled(
-                            !scan.credentials.password.is_empty(),
-                            egui::Button::new("Copy Password"),
-                        )
-                        .clicked()
-                    {
-                        ctx.copy_text(scan.credentials.password.clone());
-                        self.status =
-                            format!("Copied password for '{}' to the clipboard.", scan.credentials.ssid);
-                    }
+                ui.allocate_ui_at_rect(overlay_rect, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(170))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(24)))
+                        .corner_radius(egui::CornerRadius::same(18))
+                        .inner_margin(egui::Margin::symmetric(16, 12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(message)
+                                    .color(egui::Color32::WHITE)
+                                    .size(15.0),
+                            );
+                        });
                 });
             }
         });
@@ -277,25 +313,49 @@ impl eframe::App for WifiScanApp {
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .frame(
+                        egui::Frame::window(&ctx.style())
+                            .corner_radius(egui::CornerRadius::same(22))
+                            .shadow(egui::epaint::Shadow {
+                                offset: [0, 16],
+                                blur: 32,
+                                spread: 0,
+                                color: egui::Color32::from_black_alpha(60),
+                            })
+                            .inner_margin(egui::Margin::same(20)),
+                    )
                     .show(ctx, |ui| {
-                        ui.label(format!("Connect to '{}'? ", scan.credentials.ssid));
+                        ui.set_width(320.0);
+                        ui.label(
+                            egui::RichText::new("Connect to Wi-Fi?")
+                                .size(24.0)
+                                .strong(),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(&scan.credentials.ssid)
+                                .size(20.0)
+                                .color(egui::Color32::from_rgb(32, 32, 36)),
+                        );
+                        ui.add_space(6.0);
                         if scan.credentials.hidden {
-                            ui.monospace("Hidden network: true");
+                            ui.label(
+                                egui::RichText::new("Hidden network")
+                                    .size(14.0)
+                                    .color(egui::Color32::from_gray(110)),
+                            );
                         }
+                        ui.add_space(14.0);
                         ui.horizontal(|ui| {
-                            if ui.button("Connect").clicked() {
-                                let result = connect_to_wifi(&scan.credentials);
-                                self.status = match result {
-                                    Ok(()) => format!("Connected to '{}'.", scan.credentials.ssid),
-                                    Err(err) => format!("Connection failed: {err:#}"),
-                                };
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            if ui
+                                .add_sized([110.0, 36.0], egui::Button::new("Not Now"))
+                                .clicked()
+                            {
                                 self.connect_prompt_open = false;
                             }
                             if ui
-                                .add_enabled(
-                                    !scan.credentials.password.is_empty(),
-                                    egui::Button::new("Copy Password"),
-                                )
+                                .add_sized([110.0, 36.0], egui::Button::new("Copy Password"))
                                 .clicked()
                             {
                                 ctx.copy_text(scan.credentials.password.clone());
@@ -304,7 +364,15 @@ impl eframe::App for WifiScanApp {
                                     scan.credentials.ssid
                                 );
                             }
-                            if ui.button("Not now").clicked() {
+                            if ui
+                                .add_sized([110.0, 36.0], egui::Button::new("Connect"))
+                                .clicked()
+                            {
+                                let result = connect_to_wifi(&scan.credentials);
+                                self.status = match result {
+                                    Ok(()) => format!("Connected to '{}'.", scan.credentials.ssid),
+                                    Err(err) => format!("Connection failed: {err:#}"),
+                                };
                                 self.connect_prompt_open = false;
                             }
                         });
@@ -434,8 +502,6 @@ fn spawn_detection_worker(
     stop_rx: Receiver<()>,
 ) {
     thread::spawn(move || {
-        let mut last_payload = None;
-
         loop {
             if stop_rx.try_recv().is_ok() {
                 break;
@@ -450,17 +516,14 @@ fn spawn_detection_worker(
             }
 
             if let Some(payload) = decode_qr_from_image_current(&frame_image) {
-                if last_payload.as_deref() != Some(payload.as_str()) {
-                    match parse_wifi_qr(&payload) {
-                        Ok(credentials) => {
-                            last_payload = Some(payload);
-                            let _ = frame_tx.try_send(FrameUpdate::Scan(ScanResult { credentials }));
-                        }
-                        Err(err) => {
-                            let _ = frame_tx.try_send(FrameUpdate::Error(format!(
-                                "QR code found, but it is not a valid Wi-Fi payload: {err:#}"
-                            )));
-                        }
+                match parse_wifi_qr(&payload) {
+                    Ok(credentials) => {
+                        let _ = frame_tx.try_send(FrameUpdate::Scan(ScanResult { credentials }));
+                    }
+                    Err(err) => {
+                        let _ = frame_tx.try_send(FrameUpdate::Error(format!(
+                            "QR code found, but it is not a valid Wi-Fi payload: {err:#}"
+                        )));
                     }
                 }
             }
@@ -554,6 +617,70 @@ fn write_qr_png(path: &str, payload: &str) -> Result<()> {
         .context("failed to generate QR PNG")?;
     std::fs::write(path, bytes).with_context(|| format!("failed to write QR PNG to {path}"))?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct MenuBarState {
+    icon: TrayIcon,
+    toggle_item: MenuItem,
+    quit_item: MenuItem,
+}
+
+#[cfg(target_os = "macos")]
+impl MenuBarState {
+    fn new() -> Result<Self> {
+        let menu = Menu::new();
+        let toggle_item = MenuItem::new("Hide Window", true, None);
+        let quit_item = MenuItem::new("Quit", true, None);
+        menu.append_items(&[&toggle_item, &quit_item])?;
+
+        let icon = TrayIconBuilder::new()
+            .with_tooltip("WiFi QR Scanner")
+            .with_icon(menu_bar_icon()?)
+            .with_icon_as_template(true)
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .build()?;
+
+        Ok(Self {
+            icon,
+            toggle_item,
+            quit_item,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn menu_bar_icon() -> Result<tray_icon::Icon> {
+    const SIZE: u32 = 18;
+    let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let idx = ((y * SIZE + x) * 4) as usize;
+            let alpha = if camera_glyph_alpha(x as i32, y as i32, SIZE as i32) {
+                255
+            } else {
+                0
+            };
+            rgba[idx] = 0;
+            rgba[idx + 1] = 0;
+            rgba[idx + 2] = 0;
+            rgba[idx + 3] = alpha;
+        }
+    }
+
+    tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).context("failed to build menu bar icon")
+}
+
+#[cfg(target_os = "macos")]
+fn camera_glyph_alpha(x: i32, y: i32, size: i32) -> bool {
+    let body = (3..=14).contains(&x) && (5..=13).contains(&y);
+    let top = (6..=11).contains(&x) && (3..=5).contains(&y);
+    let lens_dx = x - (size / 2);
+    let lens_dy = y - 9;
+    let lens = lens_dx * lens_dx + lens_dy * lens_dy <= 9;
+    body || top || lens
 }
 
 fn list_cameras(cameras: &[CameraInfo]) {
