@@ -1,0 +1,16 @@
+[package]
+name = "wifiscan"
+version = "0.1.0"
+edition = "2024"
+default-run = "wifiscan"
+
+[dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+eframe = "0.33"
+egui = "0.33"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+nokhwa = { version = "0.10", features = ["input-native"] }
+quircs = "0.10"
+qrcode-generator = "5.0"
+zxing-cpp = { version = "0.5.1", features = ["bundled", "image"] }
