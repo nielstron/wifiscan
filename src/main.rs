@@ -15,7 +15,7 @@ use qrcode_generator::QrCodeEcc;
 #[cfg(target_os = "macos")]
 use tray_icon::{
     MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
-    menu::{Menu, MenuEvent, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, Submenu},
 };
 use wifiscan::decode::{decode_qr_from_image_current, decode_qr_from_path};
 
@@ -84,6 +84,7 @@ fn main() -> Result<()> {
 
 struct WifiScanApp {
     cameras: Vec<CameraInfo>,
+    selected_camera: usize,
     frame_rx: Receiver<FrameUpdate>,
     stop_tx: Option<Sender<()>>,
     texture: Option<TextureHandle>,
@@ -101,7 +102,7 @@ struct WifiScanApp {
 impl WifiScanApp {
     fn new(cameras: Vec<CameraInfo>) -> Self {
         let selected_camera = default_camera_index(&cameras);
-        let (_selected_camera, frame_rx, stop_tx, status) =
+        let (selected_camera, frame_rx, stop_tx, status) =
             match start_first_available_camera(&cameras, selected_camera) {
                 Ok((selected_camera, frame_rx, stop_tx)) => (
                     selected_camera,
@@ -119,6 +120,7 @@ impl WifiScanApp {
 
         Self {
             cameras,
+            selected_camera,
             frame_rx,
             stop_tx,
             texture: None,
@@ -140,7 +142,7 @@ impl WifiScanApp {
             return;
         }
 
-        match MenuBarState::new() {
+        match MenuBarState::new(&self.cameras, self.selected_camera) {
             Ok(tray) => self.tray = Some(tray),
             Err(err) => {
                 self.status = format!("Failed to start menu bar icon: {err:#}");
@@ -148,8 +150,63 @@ impl WifiScanApp {
         }
     }
 
+    fn stop_camera(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        self.frame_rx = empty_receiver();
+        self.texture = None;
+        self.last_preview_update = Instant::now();
+    }
+
+    fn start_camera(&mut self) {
+        match start_first_available_camera(&self.cameras, self.selected_camera) {
+            Ok((selected_camera, frame_rx, stop_tx)) => {
+                self.selected_camera = selected_camera;
+                self.frame_rx = frame_rx;
+                self.stop_tx = Some(stop_tx);
+                self.status = "Point the camera at a Wi-Fi QR code.".to_owned();
+                self.last_preview_update = Instant::now();
+            }
+            Err(err) => {
+                self.frame_rx = empty_receiver();
+                self.stop_tx = None;
+                self.status = describe_camera_error(&err);
+            }
+        }
+    }
+
+    fn select_camera(&mut self, index: usize) {
+        if index >= self.cameras.len() {
+            return;
+        }
+
+        self.selected_camera = index;
+        self.last_scan = None;
+        self.connect_prompt_open = false;
+
+        if self.window_visible {
+            self.stop_camera();
+            self.start_camera();
+        } else {
+            self.status = format!(
+                "Selected camera '{}'.",
+                self.cameras[index].human_name()
+            );
+        }
+    }
+
     fn set_window_visible(&mut self, ctx: &egui::Context, visible: bool) {
+        if self.window_visible == visible {
+            return;
+        }
+
         self.window_visible = visible;
+        if visible {
+            self.start_camera();
+        } else {
+            self.stop_camera();
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
         if visible {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -168,12 +225,20 @@ impl eframe::App for WifiScanApp {
             let quit_id = tray.quit_item.id().clone();
             let tray_id = tray.icon.id().clone();
             let mut toggle_window = false;
+            let mut selected_camera = None;
 
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == toggle_id {
                     toggle_window = true;
                 } else if event.id == quit_id {
                     self.should_quit = true;
+                } else if let Some((index, _)) = tray
+                    .camera_items
+                    .iter()
+                    .enumerate()
+                    .find(|(_, item)| event.id == item.id())
+                {
+                    selected_camera = Some(index);
                 }
             }
 
@@ -194,6 +259,10 @@ impl eframe::App for WifiScanApp {
 
             if toggle_window {
                 self.set_window_visible(ctx, !self.window_visible);
+            }
+
+            if let Some(index) = selected_camera {
+                self.select_camera(index);
             }
         }
 
@@ -234,6 +303,9 @@ impl eframe::App for WifiScanApp {
             } else {
                 "Show Window"
             });
+            for (index, item) in tray.camera_items.iter().enumerate() {
+                item.set_checked(index == self.selected_camera);
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -623,16 +695,24 @@ fn write_qr_png(path: &str, payload: &str) -> Result<()> {
 struct MenuBarState {
     icon: TrayIcon,
     toggle_item: MenuItem,
+    camera_items: Vec<CheckMenuItem>,
     quit_item: MenuItem,
 }
 
 #[cfg(target_os = "macos")]
 impl MenuBarState {
-    fn new() -> Result<Self> {
+    fn new(cameras: &[CameraInfo], selected_camera: usize) -> Result<Self> {
         let menu = Menu::new();
         let toggle_item = MenuItem::new("Hide Window", true, None);
+        let camera_menu = Submenu::new("Camera", true);
+        let mut camera_items = Vec::with_capacity(cameras.len());
+        for (index, camera) in cameras.iter().enumerate() {
+            let item = CheckMenuItem::new(camera.human_name(), true, index == selected_camera, None);
+            camera_menu.append(&item)?;
+            camera_items.push(item);
+        }
         let quit_item = MenuItem::new("Quit", true, None);
-        menu.append_items(&[&toggle_item, &quit_item])?;
+        menu.append_items(&[&toggle_item, &camera_menu, &quit_item])?;
 
         let icon = TrayIconBuilder::new()
             .with_tooltip("WiFi QR Scanner")
@@ -645,6 +725,7 @@ impl MenuBarState {
         Ok(Self {
             icon,
             toggle_item,
+            camera_items,
             quit_item,
         })
     }
