@@ -381,7 +381,9 @@ impl eframe::App for WifiScanApp {
 
         if self.connect_prompt_open {
             if let Some(scan) = self.last_scan.clone() {
-                egui::Window::new("Connect To Wi-Fi?")
+                let mut prompt_open = true;
+                let window_response = egui::Window::new("Connect To Wi-Fi?")
+                    .open(&mut prompt_open)
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -399,12 +401,6 @@ impl eframe::App for WifiScanApp {
                     .show(ctx, |ui| {
                         ui.set_width(320.0);
                         ui.label(
-                            egui::RichText::new("Connect to Wi-Fi?")
-                                .size(24.0)
-                                .strong(),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
                             egui::RichText::new(&scan.credentials.ssid)
                                 .size(20.0)
                                 .color(egui::Color32::from_rgb(32, 32, 36)),
@@ -420,12 +416,6 @@ impl eframe::App for WifiScanApp {
                         ui.add_space(14.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
-                            if ui
-                                .add_sized([110.0, 36.0], egui::Button::new("Not Now"))
-                                .clicked()
-                            {
-                                self.connect_prompt_open = false;
-                            }
                             if ui
                                 .add_sized([110.0, 36.0], egui::Button::new("Copy Password"))
                                 .clicked()
@@ -449,6 +439,23 @@ impl eframe::App for WifiScanApp {
                             }
                         });
                     });
+
+                if prompt_open {
+                    if let Some(window_response) = &window_response {
+                        let outside_click = ctx.input(|input| {
+                            input.pointer.any_pressed()
+                                && input
+                                    .pointer
+                                    .press_origin()
+                                    .is_some_and(|pos| !window_response.response.rect.contains(pos))
+                        });
+                        if outside_click {
+                            prompt_open = false;
+                        }
+                    }
+                }
+
+                self.connect_prompt_open = prompt_open;
             } else {
                 self.connect_prompt_open = false;
             }
