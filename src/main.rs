@@ -5,14 +5,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
-use image::{DynamicImage, GrayImage};
+use image::DynamicImage;
 use nokhwa::{
     Camera,
     pixel_format::RgbFormat,
     utils::{ApiBackend, CameraIndex, CameraInfo, RequestedFormat, RequestedFormatType},
 };
 use qrcode_generator::QrCodeEcc;
-use zxingcpp::{BarcodeFormat, Binarizer};
+use wifiscan::decode::{decode_qr_from_image_current, decode_qr_from_path};
 
 fn main() -> Result<()> {
     let cameras = nokhwa::query(ApiBackend::Auto).context("failed to enumerate cameras")?;
@@ -168,7 +168,6 @@ impl eframe::App for WifiScanApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Wi-Fi QR Scanner");
-            ui.label("Scan a standard Wi-Fi QR code and connect through macOS.");
             ui.separator();
 
             if self.cameras.is_empty() {
@@ -240,7 +239,7 @@ impl eframe::App for WifiScanApp {
                     if scan.credentials.password.is_empty() {
                         "<empty>"
                     } else {
-                        "••••••••"
+                        &scan.credentials.password
                     }
                 ));
                 if scan.credentials.hidden {
@@ -417,7 +416,7 @@ fn start_camera_worker(
             let _ = frame_tx.try_send(FrameUpdate::Preview(color));
 
             let frame_image = DynamicImage::ImageRgb8(rgb);
-            if let Some(payload) = decode_first_qr_with_fallbacks(&frame_image) {
+            if let Some(payload) = decode_qr_from_image_current(&frame_image) {
                 if last_payload.as_deref() != Some(payload.as_str()) {
                     match parse_wifi_qr(&payload) {
                         Ok(credentials) => {
@@ -478,94 +477,6 @@ fn camera_attempt_order(count: usize, preferred_index: usize) -> impl Iterator<I
     std::iter::once(preferred_index).chain((0..count).filter(move |index| *index != preferred_index))
 }
 
-fn decode_first_qr(image: &GrayImage) -> Option<String> {
-    let mut decoder = quircs::Quirc::default();
-    let codes = decoder.identify(image.width() as usize, image.height() as usize, image.as_raw());
-
-    for code in codes {
-        let Ok(code) = code else {
-            continue;
-        };
-        let Ok(decoded) = code.decode() else {
-            continue;
-        };
-        if let Ok(payload) = String::from_utf8(decoded.payload) {
-            return Some(payload);
-        }
-    }
-
-    None
-}
-
-fn decode_first_qr_with_fallbacks(image: &DynamicImage) -> Option<String> {
-    let grayscale = image.to_luma8();
-    if let Some(payload) = decode_first_qr(&grayscale) {
-        return Some(payload);
-    }
-
-    for prepared in prepared_images_for_zxing(image) {
-        if let Some(payload) = decode_with_zxing(&prepared) {
-            return Some(payload);
-        }
-    }
-
-    None
-}
-
-fn decode_with_zxing(image: &DynamicImage) -> Option<String> {
-    for is_pure in [false, true] {
-        for binarizer in [
-            Binarizer::LocalAverage,
-            Binarizer::GlobalHistogram,
-            Binarizer::FixedThreshold,
-            Binarizer::BoolCast,
-        ] {
-            let reader = zxingcpp::read()
-                .formats(&[BarcodeFormat::QRCode])
-                .try_harder(true)
-                .try_rotate(true)
-                .try_invert(true)
-                .try_downscale(true)
-                .is_pure(is_pure)
-                .return_errors(true)
-                .binarizer(binarizer)
-                .max_number_of_symbols(1);
-
-            let Ok(barcodes) = reader.from(image) else {
-                continue;
-            };
-            if let Some(payload) = barcodes
-                .into_iter()
-                .find(|barcode| barcode.is_valid() && barcode.format() == BarcodeFormat::QRCode)
-                .map(|barcode| barcode.text())
-            {
-                return Some(payload);
-            }
-        }
-    }
-
-    None
-}
-
-fn prepared_images_for_zxing(image: &DynamicImage) -> Vec<DynamicImage> {
-    vec![
-        image.clone(),
-        image.brighten(20),
-        image.adjust_contrast(20.0),
-        image.adjust_contrast(35.0),
-        image.resize(
-            image.width().saturating_mul(2),
-            image.height().saturating_mul(2),
-            image::imageops::FilterType::CatmullRom,
-        ),
-    ]
-}
-
-fn decode_qr_from_path(path: &str) -> Result<String> {
-    let image = image::open(path).with_context(|| format!("failed to open image at {path}"))?;
-    decode_first_qr_with_fallbacks(&image).context("no QR code detected in image")
-}
-
 fn default_camera_index(cameras: &[CameraInfo]) -> usize {
     cameras
         .iter()
@@ -600,7 +511,7 @@ fn scan_camera_for_qr(camera: &CameraInfo, timeout: Duration) -> Result<Option<S
             .decode_image::<RgbFormat>()
             .context("failed to decode camera frame")?;
         let frame_image = DynamicImage::ImageRgb8(rgb);
-        if let Some(payload) = decode_first_qr_with_fallbacks(&frame_image) {
+        if let Some(payload) = decode_qr_from_image_current(&frame_image) {
             return Ok(Some(payload));
         }
     }
@@ -758,11 +669,10 @@ fn wifi_device_name() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        WifiCredentials, decode_first_qr, parse_wifi_qr, split_wifi_fields, unescape_wifi_value,
-    };
+    use super::{WifiCredentials, parse_wifi_qr, split_wifi_fields, unescape_wifi_value};
     use image::load_from_memory;
     use qrcode_generator::QrCodeEcc;
+    use wifiscan::decode::decode_qr_from_image_current;
 
     #[test]
     fn parses_standard_wifi_qr() {
@@ -802,8 +712,8 @@ mod tests {
     fn generated_wifi_qr_decodes_end_to_end() {
         let payload = "WIFI:T:WPA;S:MockNet;P:swordfish;;";
         let png = qrcode_generator::to_png_to_vec(payload, QrCodeEcc::Medium, 512).unwrap();
-        let image = load_from_memory(&png).unwrap().to_luma8();
-        let decoded = decode_first_qr(&image).unwrap();
+        let image = load_from_memory(&png).unwrap();
+        let decoded = decode_qr_from_image_current(&image).unwrap();
         assert_eq!(decoded, payload);
     }
 }
