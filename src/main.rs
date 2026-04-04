@@ -88,6 +88,7 @@ struct WifiScanApp {
     frame_rx: Receiver<FrameUpdate>,
     stop_tx: Option<Sender<()>>,
     texture: Option<TextureHandle>,
+    preview_aspect_ratio: Option<f32>,
     last_scan: Option<ScanResult>,
     connect_prompt_open: bool,
     status: String,
@@ -124,6 +125,7 @@ impl WifiScanApp {
             frame_rx,
             stop_tx,
             texture: None,
+            preview_aspect_ratio: None,
             last_scan: None,
             connect_prompt_open: false,
             status,
@@ -156,6 +158,7 @@ impl WifiScanApp {
         }
         self.frame_rx = empty_receiver();
         self.texture = None;
+        self.preview_aspect_ratio = None;
         self.last_preview_update = Instant::now();
     }
 
@@ -211,6 +214,22 @@ impl WifiScanApp {
         if visible {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
+    }
+
+    fn sync_window_to_preview_aspect(&self, ctx: &egui::Context) {
+        let Some(aspect_ratio) = self.preview_aspect_ratio else {
+            return;
+        };
+
+        let current_size = ctx
+            .input(|input| input.viewport().inner_rect.map(|rect| rect.size()))
+            .unwrap_or_else(|| egui::vec2(420.0, 720.0));
+        let target_height = current_size.y.max(360.0);
+        let target_width = (target_height * aspect_ratio).clamp(480.0, 1600.0);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            target_width,
+            target_height,
+        )));
     }
 }
 
@@ -278,6 +297,14 @@ impl eframe::App for WifiScanApp {
         while let Ok(update) = self.frame_rx.try_recv() {
             match update {
                 FrameUpdate::Preview(image) => {
+                    let aspect_ratio = image.size[0] as f32 / image.size[1] as f32;
+                    let aspect_changed = self
+                        .preview_aspect_ratio
+                        .is_none_or(|current| (current - aspect_ratio).abs() > 0.01);
+                    if aspect_changed {
+                        self.preview_aspect_ratio = Some(aspect_ratio);
+                        self.sync_window_to_preview_aspect(ctx);
+                    }
                     let texture = self.texture.get_or_insert_with(|| {
                         ctx.load_texture("camera-preview", image.clone(), TextureOptions::LINEAR)
                     });
@@ -314,7 +341,7 @@ impl eframe::App for WifiScanApp {
             if let Some(texture) = &self.texture {
                 let image_size = texture.size_vec2();
                 let scale = (panel_rect.width() / image_size.x)
-                    .max(panel_rect.height() / image_size.y);
+                    .min(panel_rect.height() / image_size.y);
                 let scaled_size = image_size * scale;
                 let image_rect = egui::Rect::from_center_size(panel_rect.center(), scaled_size);
                 ui.put(
