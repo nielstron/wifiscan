@@ -32,10 +32,8 @@ pub fn decode_qr_from_image_cpu_legacy(image: &DynamicImage) -> Option<String> {
         return Some(payload);
     }
 
-    for prepared in prepared_images_for_zxing(image) {
-        if let Some(payload) = decode_with_zxing(&prepared) {
-            return Some(payload);
-        }
+    if let Some(payload) = decode_with_zxing(&image) {
+        return Some(payload);
     }
 
     None
@@ -131,18 +129,4 @@ pub fn decode_with_zxing(image: &DynamicImage) -> Option<String> {
     }
 
     None
-}
-
-pub fn prepared_images_for_zxing(image: &DynamicImage) -> Vec<DynamicImage> {
-    vec![
-        image.clone(),
-        image.brighten(20),
-        image.adjust_contrast(20.0),
-        image.adjust_contrast(35.0),
-        image.resize(
-            image.width().saturating_mul(2),
-            image.height().saturating_mul(2),
-            image::imageops::FilterType::CatmullRom,
-        ),
-    ]
 }
