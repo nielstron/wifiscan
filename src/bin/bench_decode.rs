@@ -4,9 +4,13 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use image::DynamicImage;
 use qrcode_generator::QrCodeEcc;
-use wifiscan::decode::{decode_qr_from_image_cpu_legacy, decode_qr_from_image_current};
+use wifiscan::decode::{
+    decode_qr_from_image_cpu_legacy, decode_qr_from_image_current, decode_qr_from_image_parallel,
+    detection_parallelism_budget,
+};
 
 fn main() -> Result<()> {
+    println!("detector_parallelism_budget={}", detection_parallelism_budget());
     let real_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/Users/niels/Pictures/Photo on 04.04.2026 at 10.41.jpg".to_owned());
@@ -27,6 +31,7 @@ fn main() -> Result<()> {
 
     for (case_name, image) in cases {
         run_case(case_name, "legacy_cpu", &image, decode_qr_from_image_cpu_legacy);
+        run_case(case_name, "parallel", &image, decode_qr_from_image_parallel);
         run_case(case_name, "current", &image, decode_qr_from_image_current);
     }
 

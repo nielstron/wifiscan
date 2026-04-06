@@ -1,3 +1,5 @@
+use std::sync::mpsc;
+use std::thread;
 use std::io::Cursor;
 
 use anyhow::{Context, Result};
@@ -19,19 +21,64 @@ pub fn decode_qr_from_path(path: &str) -> Result<String> {
 }
 
 pub fn decode_qr_from_image_current(image: &DynamicImage) -> Option<String> {
-    
-    if let Some(payload) = decode_with_vision(image) {
-        return Some(payload);
-    }
-    decode_qr_from_image_cpu_legacy(image)
+    decode_qr_from_image_parallel(image)
+}
+
+pub fn decode_qr_from_image_parallel(image: &DynamicImage) -> Option<String> {
+    let detector_count = 3;
+    let (tx, rx) = mpsc::channel();
+    thread::scope(|scope| {
+        let tx_vision = tx.clone();
+        scope.spawn(move || {
+            let _ = tx_vision.send(decode_with_vision(image));
+        });
+
+        let tx_quircs = tx.clone();
+        scope.spawn(move || {
+            let _ = tx_quircs.send(decode_with_quircs_image(image));
+        });
+
+        let tx_zxing = tx;
+        scope.spawn(move || {
+            let _ = tx_zxing.send(decode_with_zxing(image));
+        });
+
+        for _ in 0..detector_count {
+            let Ok(result) = rx.recv() else {
+                break;
+            };
+            if let Some(payload) = result {
+                return Some(payload);
+            }
+        }
+
+        None
+    })
 }
 
 pub fn decode_qr_from_image_cpu_legacy(image: &DynamicImage) -> Option<String> {
-    if let Some(payload) = decode_with_zxing(&image) {
+    if let Some(payload) = decode_with_quircs_image(image) {
         return Some(payload);
     }
 
-    None
+    decode_with_zxing(image)
+}
+
+pub fn detection_parallelism_budget() -> usize {
+    let available = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let fraction = std::env::var("WIFISCAN_DETECTOR_CORE_FRACTION")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.1, 1.0);
+    ((available as f32 * fraction).ceil() as usize).max(1)
+}
+
+pub fn decode_with_quircs_image(image: &DynamicImage) -> Option<String> {
+    let gray = image.to_luma8();
+    decode_with_quircs(&gray)
 }
 
 pub fn decode_with_quircs(image: &GrayImage) -> Option<String> {

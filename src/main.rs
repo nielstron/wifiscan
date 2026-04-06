@@ -100,6 +100,14 @@ struct WifiScanApp {
     #[cfg(target_os = "macos")]
     tray: Option<MenuBarState>,
     #[cfg(target_os = "macos")]
+    tray_event_rx: Receiver<TrayIconEvent>,
+    #[cfg(target_os = "macos")]
+    tray_event_tx: Sender<TrayIconEvent>,
+    #[cfg(target_os = "macos")]
+    menu_event_rx: Receiver<MenuEvent>,
+    #[cfg(target_os = "macos")]
+    menu_event_tx: Sender<MenuEvent>,
+    #[cfg(target_os = "macos")]
     should_quit: bool,
 }
 
@@ -107,6 +115,10 @@ impl WifiScanApp {
     fn new(cameras: Vec<CameraInfo>) -> Self {
         let selected_camera = default_camera_index(&cameras);
         let (connect_tx, connect_rx) = unbounded();
+        #[cfg(target_os = "macos")]
+        let (tray_event_tx, tray_event_rx) = unbounded();
+        #[cfg(target_os = "macos")]
+        let (menu_event_tx, menu_event_rx) = unbounded();
         let (selected_camera, frame_rx, stop_tx, status) =
             match start_first_available_camera(&cameras, selected_camera) {
                 Ok((selected_camera, frame_rx, stop_tx)) => (
@@ -141,15 +153,37 @@ impl WifiScanApp {
             #[cfg(target_os = "macos")]
             tray: None,
             #[cfg(target_os = "macos")]
+            tray_event_rx,
+            #[cfg(target_os = "macos")]
+            tray_event_tx,
+            #[cfg(target_os = "macos")]
+            menu_event_rx,
+            #[cfg(target_os = "macos")]
+            menu_event_tx,
+            #[cfg(target_os = "macos")]
             should_quit: false,
         }
     }
 
     #[cfg(target_os = "macos")]
-    fn ensure_menu_bar(&mut self) {
+    fn ensure_menu_bar(&mut self, ctx: &egui::Context) {
         if self.tray.is_some() {
             return;
         }
+
+        let tray_event_tx = self.tray_event_tx.clone();
+        let tray_ctx = ctx.clone();
+        TrayIconEvent::set_event_handler(Some(move |event| {
+            let _ = tray_event_tx.send(event);
+            tray_ctx.request_repaint();
+        }));
+
+        let menu_event_tx = self.menu_event_tx.clone();
+        let menu_ctx = ctx.clone();
+        MenuEvent::set_event_handler(Some(move |event| {
+            let _ = menu_event_tx.send(event);
+            menu_ctx.request_repaint();
+        }));
 
         match MenuBarState::new(&self.cameras, self.selected_camera) {
             Ok(tray) => self.tray = Some(tray),
@@ -240,15 +274,15 @@ impl WifiScanApp {
         )));
     }
 
-    fn repaint_interval(&self) -> Duration {
+    fn repaint_interval(&self) -> Option<Duration> {
         if self.window_visible && self.stop_tx.is_some() {
-            Duration::from_millis(16)
+            Some(Duration::from_millis(16))
         } else if self.connect_in_flight {
-            Duration::from_millis(50)
+            Some(Duration::from_millis(50))
         } else if self.connect_prompt_open || self.window_visible {
-            Duration::from_millis(250)
+            Some(Duration::from_millis(250))
         } else {
-            Duration::from_secs(1)
+            None
         }
     }
 }
@@ -256,7 +290,7 @@ impl WifiScanApp {
 impl eframe::App for WifiScanApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "macos")]
-        self.ensure_menu_bar();
+        self.ensure_menu_bar(ctx);
 
         #[cfg(target_os = "macos")]
         if let Some(tray) = &self.tray {
@@ -266,7 +300,7 @@ impl eframe::App for WifiScanApp {
             let mut toggle_window = false;
             let mut selected_camera = None;
 
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
+            while let Ok(event) = self.menu_event_rx.try_recv() {
                 if event.id == toggle_id {
                     toggle_window = true;
                 } else if event.id == quit_id {
@@ -281,7 +315,7 @@ impl eframe::App for WifiScanApp {
                 }
             }
 
-            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            while let Ok(event) = self.tray_event_rx.try_recv() {
                 if event.id() != &tray_id {
                     continue;
                 }
@@ -538,7 +572,9 @@ impl eframe::App for WifiScanApp {
             }
         }
 
-        ctx.request_repaint_after(self.repaint_interval());
+        if let Some(interval) = self.repaint_interval() {
+            ctx.request_repaint_after(interval);
+        }
     }
 }
 
@@ -664,12 +700,14 @@ fn spawn_detection_worker(
 ) {
     thread::spawn(move || {
         loop {
-            if stop_rx.try_recv().is_ok() {
-                break;
-            }
-
-            let Ok(mut frame_image) = detect_rx.recv_timeout(Duration::from_millis(100)) else {
-                continue;
+            let mut frame_image = crossbeam_channel::select! {
+                recv(stop_rx) -> _ => break,
+                recv(detect_rx) -> message => {
+                    let Ok(frame_image) = message else {
+                        break;
+                    };
+                    frame_image
+                }
             };
 
             while let Ok(newer_frame) = detect_rx.try_recv() {
