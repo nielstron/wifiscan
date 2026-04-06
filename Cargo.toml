@@ -3,6 +3,20 @@ name = "wifiscan"
 version = "0.1.0"
 edition = "2024"
 default-run = "wifiscan"
+description = "Scan Wi-Fi QR codes from the macOS menu bar and connect to networks."
+
+[package.metadata.bundle]
+name = "WiFi QR Scanner"
+identifier = "com.niels.wifiscan"
+icon = ["assets/AppIcon.icns"]
+category = "public.app-category.utilities"
+short_description = "Scan Wi-Fi QR codes and join networks on macOS."
+long_description = """
+WiFi QR Scanner is a native macOS application that opens the camera,
+detects standard WIFI: QR payloads, and lets you join the discovered
+network from a clean menu bar interface.
+"""
+osx_info_plist_exts = ["assets/Info.plist.ext"]
 
 [dependencies]
 anyhow = "1.0"

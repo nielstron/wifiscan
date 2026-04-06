@@ -1,0 +1,4 @@
+<key>LSUIElement</key>
+<true/>
+<key>NSCameraUsageDescription</key>
+<string>WiFi QR Scanner needs camera access to scan Wi-Fi QR codes and connect you to the detected network.</string>
