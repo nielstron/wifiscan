@@ -239,6 +239,18 @@ impl WifiScanApp {
             target_height,
         )));
     }
+
+    fn repaint_interval(&self) -> Duration {
+        if self.window_visible && self.stop_tx.is_some() {
+            Duration::from_millis(16)
+        } else if self.connect_in_flight {
+            Duration::from_millis(50)
+        } else if self.connect_prompt_open || self.window_visible {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(1)
+        }
+    }
 }
 
 impl eframe::App for WifiScanApp {
@@ -526,7 +538,7 @@ impl eframe::App for WifiScanApp {
             }
         }
 
-        ctx.request_repaint_after(Duration::from_millis(16));
+        ctx.request_repaint_after(self.repaint_interval());
     }
 }
 
