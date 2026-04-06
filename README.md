@@ -11,7 +11,7 @@ cargo run
 ## Build App Bundle
 
 ```bash
-zsh ./scripts/build-macos-app.sh
+bash ./scripts/build-macos-app.sh
 ```
 
 The generated app bundle will be at:
@@ -23,6 +23,6 @@ target/release/bundle/osx/WiFi QR Scanner.app
 To install it into `~/Applications`:
 
 ```bash
-zsh ./scripts/install-macos-app.sh
+bash ./scripts/install-macos-app.sh
 ```
 
