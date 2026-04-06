@@ -19,19 +19,14 @@ pub fn decode_qr_from_path(path: &str) -> Result<String> {
 }
 
 pub fn decode_qr_from_image_current(image: &DynamicImage) -> Option<String> {
+    
     if let Some(payload) = decode_with_vision(image) {
         return Some(payload);
     }
-
     decode_qr_from_image_cpu_legacy(image)
 }
 
 pub fn decode_qr_from_image_cpu_legacy(image: &DynamicImage) -> Option<String> {
-    let grayscale = image.to_luma8();
-    if let Some(payload) = decode_with_quircs(&grayscale) {
-        return Some(payload);
-    }
-
     if let Some(payload) = decode_with_zxing(&image) {
         return Some(payload);
     }
