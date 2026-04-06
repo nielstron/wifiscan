@@ -26,12 +26,3 @@ To install it into `~/Applications`:
 zsh ./scripts/install-macos-app.sh
 ```
 
-## Notes
-
-- macOS should prompt for camera permission on first launch.
-- The Wi-Fi connection step is macOS-specific.
-- Expected QR payload shape:
-
-```text
-WIFI:T:WPA;S:MyNetwork;P:secret;;
-```
